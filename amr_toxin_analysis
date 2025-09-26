@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# Script: 06_amr_toxin_analysis.sh
+# Description: Run ABRicate for AMR (CARD) and toxin/virulence (VFDB) gene detection.
+# Path-proof for the Dolapo layout; safe to re-run.
+
+set -euo pipefail
+
+# -------- Paths (auto) --------
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ASSEMBLY_DIR="$PROJECT_ROOT/asm"
+ABRICATE_DIR="$PROJECT_ROOT/results/abricate"
+AMR_OUT="$ABRICATE_DIR/amr"
+TOX_OUT="$ABRICATE_DIR/toxin"
+SUM_OUT="$ABRICATE_DIR/summary"
+LOG_DIR="$PROJECT_ROOT/results/logs"
+
+echo "Creating output directories..."
+mkdir -p "$AMR_OUT" "$TOX_OUT" "$SUM_OUT" "$LOG_DIR"
+
+# -------- Tool & DB checks --------
+command -v abricate >/dev/null 2>&1 || { echo "ERROR: abricate not found in PATH"; exit 1; }
+
+# If your DBs are in a custom location, export this before running:
+#   export ABRICATE_DB=~/Dolapo/abricate_db
+# First-time setup (internet required): abricate --setupdb && abricate --update
+echo "ABRicate DBs:"
+abricate --list | tee "$LOG_DIR/abricate_dbs.txt" || true
+
+# Soft check (won’t exit): warn if missing typical DBs
+if ! abricate --list 2>/dev/null | awk 'tolower($1)=="card" && tolower($2)=="yes"{ok=1} END{exit ok?0:1}'; then
+  echo "WARN: CARD DB not detected. To install: export ABRICATE_DB=~/Dolapo/abricate_db; abricate --setupdb; abricate --update"
+fi
+if ! abricate --list 2>/dev/null | awk 'tolower($1)=="vfdb" && tolower($2)=="yes"{ok=1} END{exit ok?0:1}'; then
+  echo "WARN: VFDB DB not detected. To install: export ABRICATE_DB=~/Dolapo/abricate_db; abricate --setupdb; abricate --update"
+fi
+
+# -------- Input assemblies check --------
+if [ -z "$(ls -A "$ASSEMBLY_DIR"/*/contigs.fasta 2>/dev/null)" ] && \
+   [ -z "$(ls -A "$ASSEMBLY_DIR"/*/contigs.min500.fasta 2>/dev/null)" ]; then
+  echo "Error: No assembly files found in $ASSEMBLY_DIR!"
+  echo "Please run assembly.sh first."
+  exit 1
+fi
+
+echo "=== AMR AND TOXIN GENE DETECTION WITH ABRICATE ==="
+echo "Input : $ASSEMBLY_DIR"
+echo "Output: $ABRICATE_DIR"
+
+# -------- Scan loop --------
+success_count=0
+total_count=0
+failed_list=()
+
+for assembly_dir in "$ASSEMBLY_DIR"/*; do
+  [ -d "$assembly_dir" ] || continue
+  sample_name=$(basename "$assembly_dir")
+
+  # Prefer filtered contigs if present
+  if   [ -s "$assembly_dir/contigs.min500.fasta" ]; then contigs_file="$assembly_dir/contigs.min500.fasta"
+  elif [ -s "$assembly_dir/contigs.fasta"       ]; then contigs_file="$assembly_dir/contigs.fasta"
+  else
+    echo "✗ No contigs for $sample_name, skipping"
+    continue
+  fi
+
+  total_count=$((total_count + 1))
+  echo "Processing sample: $sample_name"
+
+  set +e
+  # AMR (CARD). Change to --db resfinder if you prefer.
+  echo "  Detecting AMR genes (CARD)..."
+  abricate --db card --quiet "$contigs_file" > "$AMR_OUT/${sample_name}_amr.tsv"
+  amr_rc=$?
+
+  # Toxins / Virulence (VFDB)
+  echo "  Detecting toxin/virulence genes (VFDB)..."
+  abricate --db vfdb --quiet "$contigs_file" > "$TOX_OUT/${sample_name}_toxin.tsv"
+  tox_rc=$?
+  set -e
+
+  if [ $amr_rc -eq 0 ] && [ $tox_rc -eq 0 ]; then
+    success_count=$((success_count + 1))
+    echo "✓ ABRicate completed for $sample_name"
+  else
+    echo "✗ ABRicate failed for $sample_name (amr_rc=$amr_rc, tox_rc=$tox_rc)"
+    failed_list+=("$sample_name")
+  fi
+done
+
+# -------- Summaries --------
+echo ""
+echo "Generating summary reports..."
+
+shopt -s nullglob
+AMR_TSV=( "$AMR_OUT"/*.tsv )
+TOX_TSV=( "$TOX_OUT"/*.tsv )
+shopt -u nullglob
+
+if [ "${#AMR_TSV[@]}" -gt 0 ]; then
+  abricate --summary "${AMR_TSV[@]}" > "$SUM_OUT/amr_summary.tsv"
+else
+  echo "WARN: No AMR TSV files for summary."
+fi
+
+if [ "${#TOX_TSV[@]}" -gt 0 ]; then
+  abricate --summary "${TOX_TSV[@]}" > "$SUM_OUT/toxin_summary.tsv"
+else
+  echo "WARN: No toxin TSV files for summary."
+fi
+
+# Combined raw tables (optional, handy for grepping)
+[ "${#AMR_TSV[@]}" -gt 0 ] && cat "${AMR_TSV[@]}" > "$SUM_OUT/all_amr_results.tsv" || true
+[ "${#TOX_TSV[@]}" -gt 0 ] && cat "${TOX_TSV[@]}" > "$SUM_OUT/all_toxin_results.tsv" || true
+
+echo ""
+echo "=== ABRICATE SUMMARY ==="
+echo "Total assemblies checked   : $total_count"
+echo "Successful ABRicate analyses: $success_count"
+if [ "${#failed_list[@]}" -gt 0 ]; then
+  echo "Failed samples             : ${failed_list[*]}"
+fi
+echo "Results saved to: $ABRICATE_DIR"
+echo ""
+echo "Summary files created:"
+[ -f "$SUM_OUT/amr_summary.tsv" ]   && echo "  - AMR summary     : $SUM_OUT/amr_summary.tsv"
+[ -f "$SUM_OUT/toxin_summary.tsv" ] && echo "  - Toxin summary   : $SUM_OUT/toxin_summary.tsv"
+[ -f "$SUM_OUT/all_amr_results.tsv" ]   && echo "  - Combined AMR    : $SUM_OUT/all_amr_results.tsv"
+[ -f "$SUM_OUT/all_toxin_results.tsv" ] && echo "  - Combined toxin  : $SUM_OUT/all_toxin_results.tsv"
+echo ""
+echo "Next step: interpret summaries for your report."	
